@@ -1,0 +1,5 @@
+*.yml
+
+!prometheus.yml
+
+server_health/prometheus_frontend/

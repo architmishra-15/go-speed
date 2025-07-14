@@ -1,13 +1,26 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/charmbracelet/bubbles/progress"
 	tea "github.com/charmbracelet/bubbletea"
 )
+
+const (
+	serverBase = "http://localhost:8080" // speedtest server base URL
+	testSize   = 100 * 1024 * 1024       // 100 MB payload
+	streams    = 4                       // concurrent streams for down/up
+)
+
+var httpClient = &http.Client{Transport: &http.Transport{MaxIdleConns: streams, DisableCompression: true}}
 
 type pingMsg time.Duration
 
@@ -19,6 +32,12 @@ type downloadMsg struct {
 type uploadMsg struct {
 	bytes int64
 	dur   time.Duration
+}
+
+type progressMsg struct {
+	phase string
+	done  int64
+	total int64
 }
 
 type errorMsg struct {
@@ -61,13 +80,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case uploadMsg:
 		m.uploadSpeed = float64(msg.bytes) / msg.dur.Seconds() / (1024 * 1024)
 		m.phase = "done"
+		return m, tea.Quit
+
+	case progressMsg:
+		if msg.total > 0 {
+			percent := float64(msg.done) / float64(msg.total)
+			m.progress.SetPercent(percent)
+		}
 		return m, nil
 
 	case errorMsg:
-		// On error, show and exit
 		m.phase = "error"
 		m.progress.Width = 0
-		return m, nil
+		return m, tea.Quit
 
 	default:
 		return m, nil
@@ -92,38 +117,89 @@ func (m model) View() string {
 	}
 }
 
-// pingTestCmd runs the ping test
+// helper to periodically send progress updates
+func makeProgressCmd(counter *int64, total int64, phase string) tea.Cmd {
+	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg {
+		done := atomic.LoadInt64(counter)
+		if done >= total {
+			return nil
+		}
+		return progressMsg{phase: phase, done: done, total: total}
+	})
+}
+
+// pingTestCmd runs the ping test by performing an actual GET /ping request
 func pingTestCmd() tea.Cmd {
 	return func() tea.Msg {
 		start := time.Now()
-		// TODO: perform HTTP GET /ping
-		// dummy sleep for placeholder
-		time.Sleep(50 * time.Millisecond)
+		resp, err := httpClient.Get(serverBase + "/ping")
+		if err != nil {
+			return errorMsg{err}
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
 		return pingMsg(time.Since(start))
 	}
 }
 
-// downloadTestCmd runs the download test
+// downloadTestCmd runs the download test by downloading a payload of size `testSize`
 func downloadTestCmd() tea.Cmd {
 	return func() tea.Msg {
+		url := fmt.Sprintf("%s/download?size=%d", serverBase, testSize)
 		start := time.Now()
-		// TODO: perform HTTP GET /download?size=... and track bytes
-		time.Sleep(200 * time.Millisecond)
-		bytes := int64(10 * 1024 * 1024) // placeholder 10MiB
+		resp, err := httpClient.Get(url)
+		if err != nil {
+			return errorMsg{err}
+		}
+		n, err := io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return errorMsg{err}
+		}
 		dur := time.Since(start)
-		return downloadMsg{bytes: bytes, dur: dur}
+		return downloadMsg{bytes: n, dur: dur}
 	}
 }
 
-// uploadTestCmd runs the upload test
+// uploadTestCmd runs the upload test by POST-ing a random payload of size `testSize`
 func uploadTestCmd() tea.Cmd {
 	return func() tea.Msg {
+		var totalBytes int64
+		var wg sync.WaitGroup
+		wg.Add(streams)
+		segSize := testSize / streams
+		counter := int64(0)
+
 		start := time.Now()
-		// TODO: perform HTTP POST /upload
-		time.Sleep(150 * time.Millisecond)
-		bytes := int64(10 * 1024 * 1024) // placeholder
+
+		for i := 0; i < streams; i++ {
+			go func() {
+				defer wg.Done()
+				payload := make([]byte, segSize) // zeros, no randomisation
+				req, err := http.NewRequest("POST", serverBase+"/upload", bytes.NewReader(payload))
+				if err != nil {
+					return
+				}
+				req.ContentLength = int64(segSize)
+				resp, err := httpClient.Do(req)
+				if err == nil {
+					io.Copy(io.Discard, resp.Body)
+					resp.Body.Close()
+					atomic.AddInt64(&totalBytes, int64(segSize))
+					atomic.AddInt64(&counter, int64(segSize))
+				}
+			}()
+		}
+
+		progressCmd := makeProgressCmd(&counter, int64(testSize), "upload")
+
+		wg.Wait()
 		dur := time.Since(start)
-		return uploadMsg{bytes: bytes, dur: dur}
+
+		return tea.Batch(
+			func() tea.Msg { return uploadMsg{bytes: totalBytes, dur: dur} },
+			progressCmd,
+		)()
 	}
 }
 

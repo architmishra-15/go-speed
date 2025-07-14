@@ -1,22 +1,36 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"math/rand"
 	"net/http"
+	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 var (
 	payloadChunk []byte
+
+	defaultDownloadSize int
+
+	pingCounter      = prometheus.NewCounter(prometheus.CounterOpts{Name: "ping_requests_total", Help: "Number of ping requests"})
+	downloadByteCnt  = prometheus.NewCounter(prometheus.CounterOpts{Name: "download_bytes_total", Help: "Total bytes served by /download"})
+	uploadByteCnt    = prometheus.NewCounter(prometheus.CounterOpts{Name: "upload_bytes_total", Help: "Total bytes received by /upload"})
 )
 
 func init() {
 	rand.Seed(time.Now().UnixNano())
+	prometheus.MustRegister(pingCounter, downloadByteCnt, uploadByteCnt)
 }
 
 // request details and duration
@@ -30,7 +44,13 @@ func loggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("ok"))
+}
+
 func pingHandler(w http.ResponseWriter, r *http.Request) {
+	pingCounter.Inc()
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("pong"))
 }
@@ -40,7 +60,7 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	var totalSize int
 	var err error
 	if sizeParam == "" {
-		totalSize = 40 * 1024 * 1024 // 40 MB
+		totalSize = defaultDownloadSize
 	} else {
 		totalSize, err = strconv.Atoi(sizeParam)
 		if err != nil || totalSize <= 0 {
@@ -67,6 +87,7 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		sent += n
 	}
+	downloadByteCnt.Add(float64(totalSize))
 	log.Printf("Served /download size=%d bytes", totalSize)
 }
 
@@ -80,6 +101,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(fmt.Sprintf("received %d bytes", bytesRead)))
+	uploadByteCnt.Add(float64(bytesRead))
 	log.Printf("Handled /upload: %d bytes received", bytesRead)
 }
 
@@ -92,6 +114,8 @@ func main() {
 	randomize := flag.Bool("random", false, "fill download chunks with random data")
 	defaultSize := flag.Int("default-size", 10*1024*1024, "default download size in bytes if not specified")
 	flag.Parse()
+
+	defaultDownloadSize = *defaultSize
 
 	// Prepare payload chunk once
 	payloadChunk = make([]byte, *chunkSize)
@@ -108,6 +132,8 @@ func main() {
 	mux.HandleFunc("/ping", pingHandler)
 	mux.HandleFunc("/download", downloadHandler)
 	mux.HandleFunc("/upload", uploadHandler)
+	mux.HandleFunc("/healthz", healthHandler)
+	mux.Handle("/metrics", promhttp.Handler())
 	loggedMux := loggingMiddleware(mux)
 
 	srv := &http.Server{
@@ -120,7 +146,23 @@ func main() {
 
 	log.Printf("Starting speedtest backend: port=%d, chunk-size=%d, random=%v, default-size=%d", *port, *chunkSize, *randomize, *defaultSize)
 
-	if err := srv.ListenAndServe(); err != nil {
+	// run server in goroutine for graceful shutdown
+	errChan := make(chan error, 1)
+	go func() { errChan <- srv.ListenAndServe() }()
+
+	// listen for interrupt
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	select {
+	case sig := <-sigChan:
+		log.Printf("Received signal %v, shutting down", sig)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			log.Fatalf("Graceful shutdown failed: %v", err)
+		}
+	case err := <-errChan:
 		log.Fatalf("Server failed: %v", err)
 	}
 }
