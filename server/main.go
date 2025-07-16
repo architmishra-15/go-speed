@@ -13,24 +13,17 @@ import (
 	"strconv"
 	"syscall"
 	"time"
-
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 var (
 	payloadChunk []byte
 
 	defaultDownloadSize int
-
-	pingCounter      = prometheus.NewCounter(prometheus.CounterOpts{Name: "ping_requests_total", Help: "Number of ping requests"})
-	downloadByteCnt  = prometheus.NewCounter(prometheus.CounterOpts{Name: "download_bytes_total", Help: "Total bytes served by /download"})
-	uploadByteCnt    = prometheus.NewCounter(prometheus.CounterOpts{Name: "upload_bytes_total", Help: "Total bytes received by /upload"})
 )
 
 func init() {
 	rand.Seed(time.Now().UnixNano())
-	prometheus.MustRegister(pingCounter, downloadByteCnt, uploadByteCnt)
+
 }
 
 // request details and duration
@@ -50,7 +43,7 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func pingHandler(w http.ResponseWriter, r *http.Request) {
-	pingCounter.Inc()
+
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("pong"))
 }
@@ -87,7 +80,7 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		sent += n
 	}
-	downloadByteCnt.Add(float64(totalSize))
+
 	log.Printf("Served /download size=%d bytes", totalSize)
 }
 
@@ -101,7 +94,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(fmt.Sprintf("received %d bytes", bytesRead)))
-	uploadByteCnt.Add(float64(bytesRead))
+
 	log.Printf("Handled /upload: %d bytes received", bytesRead)
 }
 
@@ -133,7 +126,7 @@ func main() {
 	mux.HandleFunc("/download", downloadHandler)
 	mux.HandleFunc("/upload", uploadHandler)
 	mux.HandleFunc("/healthz", healthHandler)
-	mux.Handle("/metrics", promhttp.Handler())
+
 	loggedMux := loggingMiddleware(mux)
 
 	srv := &http.Server{
